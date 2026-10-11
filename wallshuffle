@@ -1,0 +1,421 @@
+#!/bin/zsh
+# wallshuffle — shuffle macOS Aerial wallpapers more often than System Settings allows.
+# See README.md. Not affiliated with Apple. MIT License.
+
+emulate -L zsh
+SELF=${0:A}
+
+WP="$HOME/Library/Application Support/com.apple.wallpaper"
+STORE="$WP/Store/Index.plist"
+BACKUP="$STORE.wallshuffle-backup"
+AERIALS="$WP/aerials"
+MANIFEST="$AERIALS/manifest/entries.json"
+STRINGS="$AERIALS/manifest/TVIdleScreenStrings.bundle/Contents/Resources/Localizable.nocache.loctable"
+SHUFFLE_ALL="shuffle-*"   # IDs System Settings uses for "Shuffle All" etc. (e.g. shuffle-all-aerials)
+
+HOME_DIR="$HOME/Library/Application Support/wallshuffle"
+STATE="$HOME_DIR/state"   # pool=<shuffle ID>  last=<aerial we picked last>  lang=<ko|en|empty>
+INSTALLED="$HOME_DIR/wallshuffle"
+LABEL="local.wallshuffle"
+AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+# ── i18n
+# Every message is written as: t "한국어" "English"
+UI=en
+t() { [[ $UI == ko ]] && print -r -- "$1" || print -r -- "$2" }
+die() { print -u2 -r -- "wallshuffle: $(t "$1" "$2")"; exit 1 }
+
+system_lang() { defaults read -g AppleLanguages 2>/dev/null | awk -F'"' 'NF > 1 { print $2; exit }' }
+set_ui() { UI=${WALLSHUFFLE_LANG:-${lang:-$(system_lang)}}; [[ $UI == ko* ]] && UI=ko || UI=en }
+
+# ── State
+pool= last= lang=
+load_state() { [[ -f $STATE ]] && source "$STATE" || true }
+save_state() { mkdir -p "$HOME_DIR"; print -r -- "pool=$pool"$'\n'"last=$last"$'\n'"lang=$lang" > "$STATE" }
+
+# ── Index.plist read/write (JXA)
+# Finds every Aerial choice in Index.plist (AllSpacesAndDisplays, SystemDefault, per-display, per-Space)
+# and reads or rewrites its Configuration (assetID) and EncodedOptionValues (shuffle frequency).
+#   store get                     → "assetID<TAB>frequency"   (empty if the wallpaper is not an Aerial)
+#   store set <asset|-> <freq|->  → number of choices updated
+store() {
+  osascript -l JavaScript - "$STORE" "$@" <<'JXA'
+ObjC.import('Foundation');
+const BIN = 200, MUTABLE = 2;
+const decode = d => $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(d, MUTABLE, null, null);
+const encode = o => $.NSPropertyListSerialization.dataWithPropertyListFormatOptionsError(o, BIN, 0, null);
+const isNil = o => o === undefined || o === null || o.isNil();
+
+function aerialContents(node, out) {
+  if (node.isKindOfClass($.NSDictionary)) {
+    const choices = node.objectForKey('Choices');
+    if (!isNil(choices) && choices.isKindOfClass($.NSArray))
+      for (let i = 0; i < choices.count; i++) {
+        const c = choices.objectAtIndex(i);
+        if (c.objectForKey('Provider').js === 'com.apple.wallpaper.choice.aerials') out.push([node, c]);
+      }
+    // Visit AllSpacesAndDisplays first so `get` reports that one.
+    const keys = ObjC.deepUnwrap(node.allKeys).sort((a, b) => (b === 'AllSpacesAndDisplays') - (a === 'AllSpacesAndDisplays'));
+    for (const k of keys) aerialContents(node.objectForKey(k), out);
+  } else if (node.isKindOfClass($.NSArray)) {
+    for (let i = 0; i < node.count; i++) aerialContents(node.objectAtIndex(i), out);
+  }
+}
+
+function readFreq(content) {
+  const d = content.objectForKey('EncodedOptionValues');
+  if (isNil(d) || !d.isKindOfClass($.NSData)) return '';
+  const v = ObjC.deepUnwrap(decode(d));
+  try { return v.values.aerialShuffleFrequency.picker._0.id; } catch (e) { return ''; }
+}
+
+function writeFreq(content, freq) {
+  const d = content.objectForKey('EncodedOptionValues');
+  let v = (!isNil(d) && d.isKindOfClass($.NSData)) ? ObjC.deepUnwrap(decode(d)) : null;
+  if (!v || typeof v !== 'object') v = {};
+  v.values = v.values || {};
+  v.values.aerialShuffleFrequency = { picker: { _0: { id: freq } } };
+  content.setObjectForKey(encode($(v)), 'EncodedOptionValues');
+}
+
+function run(argv) {
+  const [path, cmd, asset, freq] = argv;
+  const plist = decode($.NSData.dataWithContentsOfFile(path));
+  if (isNil(plist)) throw new Error('cannot read ' + path);
+
+  const found = [];
+  aerialContents(plist, found);
+  if (found.length === 0) return '';
+
+  if (cmd === 'get') {
+    const [content, choice] = found[0];
+    const cfg = ObjC.deepUnwrap(decode(choice.objectForKey('Configuration'))) || {};
+    return (cfg.assetID || '') + '\t' + readFreq(content);
+  }
+
+  if (cmd === 'set') {
+    for (const [content, choice] of found) {
+      if (asset !== '-') choice.setObjectForKey(encode($({ assetID: asset })), 'Configuration');
+      if (freq !== '-') writeFreq(content, freq);
+    }
+    if (!encode(plist).writeToFileAtomically(path, true)) throw new Error('cannot write ' + path);
+    return String(found.length);
+  }
+  throw new Error('unknown command ' + cmd);
+}
+JXA
+}
+
+restart_wallpaper() { killall WallpaperAgent 2>/dev/null || true }
+
+# store set + restart. WallpaperAgent may write its old settings back while quitting,
+# so check the result and retry once.
+apply() {
+  local asset=$1 freq=$2 got n
+  for _ in 1 2; do
+    n=$(store set "$asset" "$freq") || die "배경화면 설정 파일을 쓰지 못했습니다." "Could not write the wallpaper settings file."
+    [[ -n $n ]] || die "현재 배경화면이 항공사진(Aerial)이 아닙니다. 시스템 설정 › 배경화면에서 항공사진을 먼저 고르세요." \
+                       "The current wallpaper is not an Aerial. Pick an Aerial in System Settings › Wallpaper first."
+    restart_wallpaper
+    sleep 1.5
+    got=$(store get)
+    [[ $asset == - || ${got%%$'\t'*} == $asset ]] && [[ $freq == - || ${got#*$'\t'} == $freq ]] && return 0
+  done
+  die "설정이 적용되지 않았습니다 (시스템 설정 앱이 열려 있다면 닫고 다시 시도하세요)." \
+      "The change did not stick (if System Settings is open, quit it and try again)."
+}
+
+backup_once() { [[ -f $BACKUP ]] || cp -p "$STORE" "$BACKUP" }
+
+# ── Manifest lookups
+is_pool() {  # a category shuffle or "Shuffle All"?
+  [[ $1 == ${~SHUFFLE_ALL} ]] || jq -e --arg id "$1" 'any(.categories[]; .id == $id)' "$MANIFEST" >/dev/null
+}
+
+localized() {  # localization key → display name in the UI language (fallback: English)
+  local key=$1 l s
+  for l in $UI en; do
+    s=$(plutil -extract "$l.$key" raw -o - "$STRINGS" 2>/dev/null) && { print -r -- "$s"; return }
+  done
+  print -r -- "$key"
+}
+
+name_of() {
+  local id=$1 key
+  [[ $id == ${~SHUFFLE_ALL} ]] && { t "전체 항공사진" "All Aerials"; return }
+  key=$(jq -r --arg id "$id" '(.categories[], .assets[]) | select(.id == $id) | .localizedNameKey' "$MANIFEST" | head -1)
+  [[ -n $key ]] && localized "$key" || print -r -- "$id"
+}
+
+# Downloaded aerials that belong to the shuffle pool.
+# Apple's own shuffle skips aerials inside sub-folders (e.g. Cityscape › San Francisco;
+# includeInShuffle=false). They were downloaded on purpose, so include them. The Mac and
+# Dynamic (light/dark) wallpapers are top-level yet excluded by Apple — keep those out.
+downloaded_in_pool() {
+  local id
+  jq -r --arg c "$1" \
+    '.assets[] | select((.includeInShuffle or (.showInTopLevel | not)) and (($c | startswith("shuffle-")) or (.categories | index($c)))) | .id' "$MANIFEST" |
+  while read -r id; do [[ -f $AERIALS/videos/$id.mov ]] && print -r -- "$id"; done
+}
+
+# Decide which pool to pick from. If the user picked another shuffle in System Settings, follow it.
+resolve_pool() {
+  local current=$1
+  load_state
+  if is_pool "$current"; then
+    pool=$current
+  elif [[ -n $pool && $current == $last ]]; then
+    :  # still the aerial we picked — keep the saved pool
+  else
+    return 1  # the user picked a single aerial by hand
+  fi
+}
+
+# ── Intervals
+freq_id() {
+  case $1 in
+    5s)          print shuffle_every_5_seconds ;;
+    continuous)  print shuffle_continuously ;;
+    12h)         print shuffle_every_12_hours ;;
+    1d)          print shuffle_every_1_day ;;
+    2d)          print shuffle_every_2_days ;;
+    1w)          print shuffle_every_1_week ;;
+    1mo)         print shuffle_every_1_month ;;
+    *) die "알 수 없는 주기: $1  (5s | continuous | 12h | 1d | 2d | 1w | 1mo)" \
+           "Unknown frequency: $1  (5s | continuous | 12h | 1d | 2d | 1w | 1mo)" ;;
+  esac
+}
+
+freq_label() {
+  case $1 in
+    shuffle_every_5_seconds) t "5초마다 (숨김 옵션)" "Every 5 seconds (hidden option)" ;;
+    shuffle_continuously)    t "계속 — 영상이 끝날 때마다" "Continuously — whenever a video ends" ;;
+    shuffle_every_12_hours)  t "12시간마다" "Every 12 hours" ;;
+    shuffle_every_1_day)     t "매일" "Every day" ;;
+    shuffle_every_2_days)    t "격일" "Every 2 days" ;;
+    shuffle_every_1_week)    t "매주" "Every week" ;;
+    shuffle_every_1_month)   t "매달" "Every month" ;;
+    *) print -r -- "${1:-$(t "(없음)" "(none)")}" ;;
+  esac
+}
+
+parse_interval() {  # 30m → 1800
+  [[ $1 =~ '^([0-9]+)(s|m|h)$' ]] || die "간격은 90s, 30m, 2h 같은 형식으로 쓰세요." "Write the interval like 90s, 30m or 2h."
+  local n=$match[1]
+  case $match[2] in s) ;; m) n=$((n*60)) ;; h) n=$((n*3600)) ;; esac
+  (( n >= 60 )) || die "최소 간격은 60초입니다. 더 자주 바꾸려면: wallshuffle native 5s" \
+                       "The minimum interval is 60s. For faster changes use: wallshuffle native 5s"
+  print $n
+}
+
+human_interval() {
+  local s=$1 n
+  if   (( s % 3600 == 0 )); then n=$((s/3600)); t "${n}시간" "$n hour$( ((n > 1)) && print s)"
+  elif (( s % 60 == 0 ));   then n=$((s/60));   t "${n}분"   "$n minute$( ((n > 1)) && print s)"
+  else                                           t "${s}초"   "$s seconds"
+  fi
+}
+
+timer_interval() { [[ -f $AGENT ]] && plutil -extract StartInterval raw -o - "$AGENT" 2>/dev/null }
+
+# ── Commands
+cmd_status() {
+  local got asset freq secs
+  got=$(store get)
+  [[ -n $got ]] || { t "현재 배경화면: 항공사진 아님 (wallshuffle은 항공사진 배경화면에서만 동작)" \
+                       "Current wallpaper: not an Aerial (wallshuffle only works with Aerial wallpapers)"; return }
+  asset=${got%%$'\t'*} freq=${got#*$'\t'}
+  load_state
+  if is_pool "$asset"; then
+    t "현재: $(name_of "$asset") 셔플 · Apple 주기 $(freq_label "$freq")" \
+      "Current: Shuffle $(name_of "$asset") · Apple interval: $(freq_label "$freq")"
+    pool=$asset
+  elif [[ -n $pool && $asset == $last ]]; then
+    t "현재: $(name_of "$asset")  (wallshuffle이 $(name_of "$pool") 중에서 고름)" \
+      "Current: $(name_of "$asset")  (picked by wallshuffle from $(name_of "$pool"))"
+  else
+    t "현재: $(name_of "$asset")  (직접 고른 항공사진 — 타이머가 건드리지 않음)" \
+      "Current: $(name_of "$asset")  (picked by hand — the timer leaves it alone)"
+    pool=
+  fi
+  if ! secs=$(timer_interval); then
+    t "타이머: 없음" "Timer: off"
+  elif [[ -n $pool ]]; then
+    t "타이머: $(human_interval "$secs")마다 $(name_of "$pool") 중에서 무작위로 교체" \
+      "Timer: every $(human_interval "$secs"), random pick from $(name_of "$pool")"
+  else
+    t "타이머: $(human_interval "$secs")마다 (셔플을 다시 고르면 동작)" \
+      "Timer: every $(human_interval "$secs") (resumes once you pick a shuffle again)"
+  fi
+  [[ -n $pool ]] && t "셔플 범위에서 내려받은 항공사진: $(downloaded_in_pool "$pool" | wc -l | tr -d ' ')개" \
+                      "Downloaded aerials in this pool: $(downloaded_in_pool "$pool" | wc -l | tr -d ' ')"
+  return 0
+}
+
+cmd_next() {
+  local quiet=$1 got current
+  got=$(store get)
+  [[ -n $got ]] || { [[ -n $quiet ]] && return 0
+                     die "현재 배경화면이 항공사진이 아닙니다." "The current wallpaper is not an Aerial." }
+  current=${got%%$'\t'*}
+  if ! resolve_pool "$current"; then
+    [[ -n $quiet ]] && return 0  # never override an aerial the user picked by hand
+    die "지금은 항공사진 하나가 직접 선택돼 있습니다. 설정 앱에서 셔플(카테고리)을 고른 뒤 다시 실행하세요." \
+        "A single aerial is selected. Pick a shuffle (e.g. Shuffle Cityscape) in System Settings, then run this again."
+  fi
+
+  local -a ids=( ${(f)"$(downloaded_in_pool "$pool")"} )
+  (( ${#ids} > 1 )) && ids=( ${ids:#$current} )   # never repeat the current one
+  (( ${#ids} > 0 )) || die "$(name_of "$pool")에 내려받은 항공사진이 없습니다. 설정 앱에서 몇 개 내려받아 주세요." \
+                           "No downloaded aerials in $(name_of "$pool"). Download a few in System Settings › Wallpaper."
+
+  local pick=${ids[RANDOM % ${#ids} + 1]}
+  backup_once
+  apply "$pick" -
+  last=$pick; save_state
+  [[ -n $quiet ]] || t "→ $(name_of "$pick")  ($(name_of "$pool") 셔플)" "→ $(name_of "$pick")  (shuffling $(name_of "$pool"))"
+}
+
+cmd_every() {
+  local secs got current
+  secs=$(parse_interval "$1") || exit 1
+  got=$(store get); [[ -n $got ]] || die "현재 배경화면이 항공사진이 아닙니다." "The current wallpaper is not an Aerial."
+  current=${got%%$'\t'*}
+  resolve_pool "$current" || die "설정 앱에서 셔플(예: '도시 풍경 셔플')을 먼저 고르세요." \
+                                 "Pick a shuffle (e.g. Shuffle Cityscape) in System Settings › Wallpaper first."
+  save_state
+
+  [[ $SELF == $INSTALLED ]] || cmd_install >/dev/null
+  mkdir -p "${AGENT:h}"
+  cat > "$AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/zsh</string><string>$INSTALLED</string><string>next</string><string>--quiet</string></array>
+  <key>StartInterval</key><integer>$secs</integer>
+  <key>StandardErrorPath</key><string>$HOME_DIR/error.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID" "$AGENT"
+  t "타이머 설치: $(human_interval "$secs")마다 $(name_of "$pool") 중에서 바꿉니다." \
+    "Timer set: every $(human_interval "$secs"), picking from $(name_of "$pool")."
+  cmd_next
+}
+
+remove_timer() {
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  rm -f "$AGENT"
+}
+
+cmd_native() {
+  local freq got current
+  freq=$(freq_id "$1") || exit 1
+  got=$(store get); [[ -n $got ]] || die "현재 배경화면이 항공사진이 아닙니다." "The current wallpaper is not an Aerial."
+  current=${got%%$'\t'*}
+  resolve_pool "$current" || die "설정 앱에서 셔플(예: '도시 풍경 셔플')을 먼저 고르세요." \
+                                 "Pick a shuffle (e.g. Shuffle Cityscape) in System Settings › Wallpaper first."
+  remove_timer
+  backup_once
+  apply "$pool" "$freq"
+  save_state
+  t "Apple 셔플: $(name_of "$pool") · $(freq_label "$freq")" "Apple shuffle: $(name_of "$pool") · $(freq_label "$freq")"
+}
+
+cmd_off() {
+  local msg got
+  msg=$(t "켜진 타이머가 없습니다." "No timer was running.")
+  [[ -f $AGENT ]] && msg=$(t "타이머를 제거했습니다." "Timer removed.")
+  remove_timer
+  got=$(store get)
+  if [[ -n $got ]] && resolve_pool "${got%%$'\t'*}"; then
+    apply "$pool" shuffle_every_12_hours
+    save_state
+    msg+=" $(t "$(name_of "$pool") 셔플 · 12시간마다로 되돌렸습니다." "Back to Apple's Shuffle $(name_of "$pool") · Every 12 hours.")"
+  fi
+  print -r -- "$msg"
+}
+
+cmd_restore() {
+  [[ -f $BACKUP ]] || die "백업이 없습니다 ($BACKUP)." "No backup found ($BACKUP)."
+  remove_timer
+  cp -p "$BACKUP" "$STORE"
+  restart_wallpaper
+  t "처음 설정으로 복구했습니다." "Restored your original wallpaper settings."
+}
+
+cmd_install() {
+  mkdir -p "$HOME_DIR"
+  [[ $SELF == $INSTALLED ]] || cp "$SELF" "$INSTALLED"
+  chmod +x "$INSTALLED"
+  t "설치: $INSTALLED" "Installed: $INSTALLED"
+}
+
+cmd_lang() {
+  case $1 in
+    ko|en) lang=$1 ;;
+    auto)  lang= ;;
+    *) die "사용법: wallshuffle lang ko|en|auto" "Usage: wallshuffle lang ko|en|auto" ;;
+  esac
+  save_state
+  set_ui
+  t "출력 언어: 한국어" "Output language: English"
+}
+
+cmd_help() {
+  if [[ $UI == ko ]]; then cat <<'EOF'
+wallshuffle — macOS 항공사진(Aerial) 배경화면을 원하는 간격으로 셔플
+
+  wallshuffle status          현재 설정 보기
+  wallshuffle every 30m       30분마다 바꾸기 (s/m/h, 최소 60s) — 백그라운드 타이머
+  wallshuffle next            지금 바로 다른 항공사진으로 바꾸기
+  wallshuffle native 5s       타이머 없이 Apple 내장 주기 쓰기
+                              5s | continuous | 12h | 1d | 2d | 1w | 1mo  (5s는 설정 앱에 없는 숨김 옵션)
+  wallshuffle off             타이머 끄기, Apple 기본 셔플(12시간)로 되돌리기
+  wallshuffle restore         처음 백업해 둔 배경화면 설정 그대로 복구
+  wallshuffle lang ko|en|auto 출력 언어
+EOF
+  else cat <<'EOF'
+wallshuffle — shuffle macOS Aerial wallpapers on any interval
+
+  wallshuffle status          show the current setup
+  wallshuffle every 30m       change every 30 minutes (s/m/h, min 60s) — background timer
+  wallshuffle next            switch to another aerial right now
+  wallshuffle native 5s       use Apple's built-in shuffle interval instead of the timer
+                              5s | continuous | 12h | 1d | 2d | 1w | 1mo  (5s is hidden in System Settings)
+  wallshuffle off             remove the timer, back to Apple's shuffle (every 12 hours)
+  wallshuffle restore         restore the wallpaper settings backed up on first use
+  wallshuffle lang ko|en|auto output language
+EOF
+  fi
+}
+
+# ── Main
+load_state
+set_ui
+case ${1:-status} in  # these work even where the checks below fail
+  -h|--help|help) cmd_help; exit ;;
+  lang) cmd_lang "${2:-}"; exit ;;
+esac
+
+command -v jq >/dev/null || die "jq가 필요합니다 (macOS 15 이상에 기본 포함)." "jq is required (bundled with macOS 15 and later)."
+[[ -f $STORE ]] || die "배경화면 설정 파일이 없습니다: $STORE" "Wallpaper settings not found: $STORE"
+[[ -d $AERIALS ]] || die "항공사진 폴더가 없습니다: $AERIALS (macOS 27 이상에서 동작합니다)" \
+                         "Aerials folder not found: $AERIALS (wallshuffle needs macOS 27 or later)"
+[[ -f $MANIFEST ]] || MANIFEST=/System/Library/ExtensionKit/Extensions/WallpaperAerialsExtension.appex/Contents/Resources/entries.json
+
+case ${1:-status} in
+  status)  cmd_status ;;
+  next)    cmd_next "${2:-}" ;;
+  every)   [[ -n ${2:-} ]] || die "사용법: wallshuffle every 30m" "Usage: wallshuffle every 30m"; cmd_every "$2" ;;
+  native)  [[ -n ${2:-} ]] || die "사용법: wallshuffle native 5s|continuous|12h|1d|2d|1w|1mo" \
+                                  "Usage: wallshuffle native 5s|continuous|12h|1d|2d|1w|1mo"; cmd_native "$2" ;;
+  off)     cmd_off ;;
+  restore) cmd_restore ;;
+  install) cmd_install ;;
+  *) die "알 수 없는 명령: $1  (wallshuffle help)" "Unknown command: $1  (wallshuffle help)" ;;
+esac
