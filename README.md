@@ -91,7 +91,7 @@ wallshuffle native 5s
 - **If you pick a single Aerial yourself** in System Settings, the timer leaves it alone until you pick a shuffle again.
 - If your wallpaper is not an Aerial, the timer does nothing.
 - Each switch restarts `WallpaperAgent`, so the desktop may flicker briefly.
-- A sleeping Mac doesn't switch; it catches up after waking. Intervals count from when you ran `every`, not from the top of the hour.
+- Time asleep or powered off counts. If the interval passed while the Mac was asleep, it switches within a minute of waking (once, not once per missed interval). Intervals count from the last switch, not from the top of the hour.
 
 ## How it works
 
@@ -102,14 +102,14 @@ On each tick, wallshuffle:
 2. picks one at random (never the current one),
 3. writes its ID into `Index.plist` and restarts `WallpaperAgent`, then checks that the change stuck.
 
-The timer is a per-user LaunchAgent (`launchd`).
+The timer is a per-user LaunchAgent (`launchd`) that checks once a minute whether the interval has passed on the clock, so sleep and restarts don't reset it.
 
 ### Files
 
 | Path | Purpose |
 |---|---|
 | `~/Library/Application Support/wallshuffle/wallshuffle` | The installed script the timer runs |
-| `~/Library/Application Support/wallshuffle/state` | Current pool, last pick, language |
+| `~/Library/Application Support/wallshuffle/state` | Pool, last pick, language, interval, time of the last switch |
 | `~/Library/Application Support/wallshuffle/error.log` | Errors from timer runs, if any |
 | `~/Library/LaunchAgents/local.wallshuffle.plist` | The timer |
 | `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist.wallshuffle-backup` | Your original wallpaper settings (used by `restore`) |
