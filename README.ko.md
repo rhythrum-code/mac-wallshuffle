@@ -98,7 +98,7 @@ wallshuffle native 5s
 - **설정 앱에서 항공사진 한 장을 직접 고르면** 다시 셔플을 고를 때까지 타이머가 건드리지 않습니다.
 - 항공사진이 아닌 배경화면이면 타이머는 아무것도 하지 않습니다.
 - 바꿀 때마다 `WallpaperAgent`를 재시작하므로 화면이 잠깐 깜빡일 수 있습니다.
-- 잠자기 중에는 바뀌지 않고 깨어난 뒤 바뀝니다. 간격은 `every`를 실행한 시점부터 계산합니다 (매 정각 아님).
+- 잠자기·전원 꺼짐 시간도 간격에 포함됩니다. 그사이 간격이 지났다면 깨어난 뒤 1분 안에 한 번 바뀝니다. 간격은 마지막으로 바뀐 시각부터 계산합니다 (매 정각 아님).
 
 ## 동작 방식
 
@@ -109,14 +109,14 @@ wallshuffle은 정해진 간격마다:
 2. 그중 하나를 무작위로 뽑아 (지금 것은 제외),
 3. `Index.plist`에 그 ID를 쓰고 `WallpaperAgent`를 재시작한 뒤, 제대로 적용됐는지 확인합니다.
 
-타이머는 사용자 LaunchAgent(`launchd`)입니다.
+타이머는 사용자 LaunchAgent(`launchd`)로, 1분마다 실제 시각 기준으로 간격이 지났는지 확인합니다. 그래서 잠자기나 재부팅으로 카운트가 초기화되지 않습니다.
 
 ### 파일 위치
 
 | 위치 | 내용 |
 |---|---|
 | `~/Library/Application Support/wallshuffle/wallshuffle` | 타이머가 실행하는 스크립트 |
-| `~/Library/Application Support/wallshuffle/state` | 셔플 범위, 마지막으로 고른 사진, 언어 |
+| `~/Library/Application Support/wallshuffle/state` | 셔플 범위, 마지막으로 고른 사진, 언어, 간격, 마지막 교체 시각 |
 | `~/Library/Application Support/wallshuffle/error.log` | 타이머 실행 중 오류 기록 |
 | `~/Library/LaunchAgents/local.wallshuffle.plist` | 타이머 |
 | `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist.wallshuffle-backup` | 원래 배경화면 설정 백업 (`restore`가 사용) |
