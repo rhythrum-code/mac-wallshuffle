@@ -3,6 +3,7 @@
 # See README.md. Not affiliated with Apple. MIT License.
 
 emulate -L zsh
+zmodload zsh/datetime   # EPOCHSECONDS
 SELF=${0:A}
 
 WP="$HOME/Library/Application Support/com.apple.wallpaper"
@@ -14,7 +15,7 @@ STRINGS="$AERIALS/manifest/TVIdleScreenStrings.bundle/Contents/Resources/Localiz
 SHUFFLE_ALL="shuffle-*"   # IDs System Settings uses for "Shuffle All" etc. (e.g. shuffle-all-aerials)
 
 HOME_DIR="$HOME/Library/Application Support/wallshuffle"
-STATE="$HOME_DIR/state"   # pool=<shuffle ID>  last=<aerial we picked last>  lang=<ko|en|empty>
+STATE="$HOME_DIR/state"   # pool, last (aerial we picked), lang, interval (seconds), changed (epoch of last switch)
 INSTALLED="$HOME_DIR/wallshuffle"
 LABEL="local.wallshuffle"
 AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -29,9 +30,12 @@ system_lang() { defaults read -g AppleLanguages 2>/dev/null | awk -F'"' 'NF > 1 
 set_ui() { UI=${WALLSHUFFLE_LANG:-${lang:-$(system_lang)}}; [[ $UI == ko* ]] && UI=ko || UI=en }
 
 # ── State
-pool= last= lang=
+pool= last= lang= interval= changed=
 load_state() { [[ -f $STATE ]] && source "$STATE" || true }
-save_state() { mkdir -p "$HOME_DIR"; print -r -- "pool=$pool"$'\n'"last=$last"$'\n'"lang=$lang" > "$STATE" }
+save_state() {
+  mkdir -p "$HOME_DIR"
+  print -rl -- "pool=$pool" "last=$last" "lang=$lang" "interval=$interval" "changed=$changed" > "$STATE"
+}
 
 # ── Index.plist read/write (JXA)
 # Finds every Aerial choice in Index.plist (AllSpacesAndDisplays, SystemDefault, per-display, per-Space)
@@ -216,7 +220,13 @@ human_interval() {
   fi
 }
 
-timer_interval() { [[ -f $AGENT ]] && plutil -extract StartInterval raw -o - "$AGENT" 2>/dev/null }
+timer_interval() { [[ -f $AGENT && -n $interval ]] && print $interval }
+
+human_left() {  # seconds → "2시간 5분" / "2h 5m" (rounded up to a minute)
+  local m=$(( ($1 + 59) / 60 )) h
+  h=$((m / 60)) m=$((m % 60))
+  if (( h > 0 )); then t "${h}시간 ${m}분" "${h}h ${m}m"; else t "${m}분" "${m} min"; fi
+}
 
 # ── Commands
 cmd_status() {
@@ -243,6 +253,10 @@ cmd_status() {
   elif [[ -n $pool ]]; then
     t "타이머: $(human_interval "$secs")마다 $(name_of "$pool") 중에서 무작위로 교체" \
       "Timer: every $(human_interval "$secs"), random pick from $(name_of "$pool")"
+    local left=$(( ${changed:-0} + secs - EPOCHSECONDS ))
+    if (( left > 0 )); then t "다음 교체: 약 $(human_left $left) 후" "Next switch: in about $(human_left $left)"
+    else                    t "다음 교체: 1분 안에" "Next switch: within a minute"
+    fi
   else
     t "타이머: $(human_interval "$secs")마다 (셔플을 다시 고르면 동작)" \
       "Timer: every $(human_interval "$secs") (resumes once you pick a shuffle again)"
@@ -272,7 +286,7 @@ cmd_next() {
   local pick=${ids[RANDOM % ${#ids} + 1]}
   backup_once
   apply "$pick" -
-  last=$pick; save_state
+  last=$pick changed=$EPOCHSECONDS; save_state
   [[ -n $quiet ]] || t "→ $(name_of "$pick")  ($(name_of "$pool") 셔플)" "→ $(name_of "$pick")  (shuffling $(name_of "$pool"))"
 }
 
@@ -283,9 +297,12 @@ cmd_every() {
   current=${got%%$'\t'*}
   resolve_pool "$current" || die "설정 앱에서 셔플(예: '도시 풍경 셔플')을 먼저 고르세요." \
                                  "Pick a shuffle (e.g. Shuffle Cityscape) in System Settings › Wallpaper first."
-  save_state
-
+  interval=$secs; save_state
   [[ $SELF == $INSTALLED ]] || cmd_install >/dev/null
+  cmd_next   # switch now; this also records the time, so the agent's first tick waits a full interval
+
+  # launchd's StartInterval pauses while the Mac sleeps and restarts at every login, so the agent
+  # only ticks once a minute; `tick` compares the wall clock with the last switch (see cmd_tick).
   mkdir -p "${AGENT:h}"
   cat > "$AGENT" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -294,8 +311,9 @@ cmd_every() {
 <dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/zsh</string><string>$INSTALLED</string><string>next</string><string>--quiet</string></array>
-  <key>StartInterval</key><integer>$secs</integer>
+  <array><string>/bin/zsh</string><string>$INSTALLED</string><string>tick</string></array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>$HOME_DIR/error.log</string>
 </dict>
 </plist>
@@ -304,12 +322,22 @@ EOF
   launchctl bootstrap "gui/$UID" "$AGENT"
   t "타이머 설치: $(human_interval "$secs")마다 $(name_of "$pool") 중에서 바꿉니다." \
     "Timer set: every $(human_interval "$secs"), picking from $(name_of "$pool")."
-  cmd_next
 }
 
 remove_timer() {
   launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
   rm -f "$AGENT"
+  interval=; save_state
+}
+
+# Run by the agent once a minute: switch when the interval has passed on the wall clock,
+# so time spent asleep or powered off counts too.
+cmd_tick() {
+  load_state
+  [[ -n $interval ]] || return 0
+  (( EPOCHSECONDS - ${changed:-0} >= interval )) || return 0
+  changed=$EPOCHSECONDS; save_state   # also when the switch is skipped, so we retry next interval, not every minute
+  cmd_next --quiet
 }
 
 cmd_native() {
@@ -395,6 +423,11 @@ EOF
 }
 
 # ── Main
+# One wallshuffle at a time: the agent ticks every minute and may overlap with a command you run.
+mkdir -p "$HOME_DIR"; : >> "$HOME_DIR/lock"
+zmodload zsh/system
+zsystem flock -t 60 "$HOME_DIR/lock" || { print -u2 "wallshuffle: busy (lock)"; exit 1 }
+
 load_state
 set_ui
 case ${1:-status} in  # these work even where the checks below fail
@@ -411,6 +444,7 @@ command -v jq >/dev/null || die "jq가 필요합니다 (macOS 15 이상에 기�
 case ${1:-status} in
   status)  cmd_status ;;
   next)    cmd_next "${2:-}" ;;
+  tick)    cmd_tick ;;
   every)   [[ -n ${2:-} ]] || die "사용법: wallshuffle every 30m" "Usage: wallshuffle every 30m"; cmd_every "$2" ;;
   native)  [[ -n ${2:-} ]] || die "사용법: wallshuffle native 5s|continuous|12h|1d|2d|1w|1mo" \
                                   "Usage: wallshuffle native 5s|continuous|12h|1d|2d|1w|1mo"; cmd_native "$2" ;;
